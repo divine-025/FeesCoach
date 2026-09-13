@@ -228,6 +228,90 @@ function describeDayOffset(days) {
 }
 
 // ==========================================
+// TOAST NOTIFICATIONS
+// ==========================================
+
+const toastContainer = document.getElementById("toast-container");
+
+/**
+ * Shows a brief toast message. type: "success" | "danger" | "default"
+ * Auto-dismisses after ~3 seconds, with a fade-out before removal.
+ */
+function showToast(message, type = "default") {
+  if (!toastContainer) return; // defensive — in case the container is missing
+  const toast = document.createElement("div");
+  toast.className = `toast${type !== "default" ? ` toast--${type}` : ""}`;
+  toast.textContent = message;
+  toastContainer.appendChild(toast);
+
+  setTimeout(() => {
+    toast.classList.add("toast--leaving");
+    toast.addEventListener("animationend", () => toast.remove(), { once: true });
+  }, 3000);
+}
+
+// ==========================================
+// MODAL FOCUS MANAGEMENT
+// ==========================================
+
+// Remembers which element had focus before a modal opened,
+// so we can return focus there when it closes (accessibility requirement).
+let lastFocusedElement = null;
+
+/** Returns all focusable elements currently inside a container. */
+function getFocusableElements(container) {
+  return Array.from(
+    container.querySelectorAll(
+      'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])'
+    )
+  ).filter(el => !el.disabled && el.offsetParent !== null);
+}
+
+/**
+ * Traps Tab/Shift+Tab focus inside the given modal element.
+ * Call once when a modal opens; it self-removes when the modal closes
+ * because we check `modalEl.hidden` on every keydown.
+ */
+function trapFocus(modalEl) {
+  function handleKeydown(event) {
+    if (modalEl.hidden) {
+      document.removeEventListener("keydown", handleKeydown);
+      return;
+    }
+    if (event.key !== "Tab") return;
+
+    const focusable = getFocusableElements(modalEl);
+    if (focusable.length === 0) return;
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+  document.addEventListener("keydown", handleKeydown);
+}
+
+/** Call when any modal opens: remembers the trigger and starts the focus trap. */
+function onModalOpen(modalEl) {
+  lastFocusedElement = document.activeElement;
+  trapFocus(modalEl);
+}
+
+/** Call when any modal closes: returns focus to whatever opened it. */
+function onModalClose() {
+  if (lastFocusedElement) {
+    lastFocusedElement.focus();
+    lastFocusedElement = null;
+  }
+}
+
+// ==========================================
 // VALIDATION
 // ==========================================
 
@@ -502,6 +586,7 @@ function addSubscription(data) {
   };
   state.subscriptions.push(subscription);
   afterStateChange();
+  showToast(`${subscription.name} added.`, "success");
 }
 
 function updateSubscription(id, data) {
@@ -519,11 +604,14 @@ function updateSubscription(id, data) {
   subscription.updatedAt = new Date().toISOString();
 
   afterStateChange();
+  showToast(`${subscription.name} updated.`, "success");
 }
 
 function deleteSubscription(id) {
+  const subscription = state.subscriptions.find(sub => sub.id === id);
   state.subscriptions = state.subscriptions.filter(sub => sub.id !== id);
   afterStateChange();
+  if (subscription) showToast(`${subscription.name} deleted.`, "danger");
 }
 
 function pauseSubscription(id) {
@@ -532,6 +620,7 @@ function pauseSubscription(id) {
   subscription.status = "paused";
   subscription.updatedAt = new Date().toISOString();
   afterStateChange();
+  showToast(`${subscription.name} paused.`);
 }
 
 function resumeSubscription(id) {
@@ -540,6 +629,7 @@ function resumeSubscription(id) {
   subscription.status = "active";
   subscription.updatedAt = new Date().toISOString();
   afterStateChange();
+  showToast(`${subscription.name} resumed.`, "success");
 }
 
 // Central hook: every CRUD action funnels through here,
@@ -572,6 +662,7 @@ function openAddSubscriptionModal() {
   clearSubscriptionFormErrors();
   dom.subscriptionModalHeading.textContent = "Add Subscription";
   dom.subscriptionModalOverlay.hidden = false;
+  onModalOpen(dom.subscriptionModalOverlay);
   dom.subNameInput.focus();
 }
 
@@ -597,6 +688,7 @@ function openEditSubscriptionModal(id) {
 
   dom.subscriptionModalHeading.textContent = "Edit Subscription";
   dom.subscriptionModalOverlay.hidden = false;
+  onModalOpen(dom.subscriptionModalOverlay);
   dom.subNameInput.focus();
 }
 
@@ -606,6 +698,7 @@ function closeSubscriptionModal() {
   dom.trialEndDateField.hidden = true;
   clearSubscriptionFormErrors();
   editingSubscriptionId = null;
+  onModalClose();
 }
 
 function openDeleteModal(id) {
@@ -614,11 +707,14 @@ function openDeleteModal(id) {
   deletingSubscriptionId = id;
   dom.deleteModalMessage.textContent = `Delete ${subscription.name}? This can't be undone.`;
   dom.deleteModalOverlay.hidden = false;
+  onModalOpen(dom.deleteModalOverlay);
+  dom.confirmDeleteBtn.focus();
 }
 
 function closeDeleteModal() {
   dom.deleteModalOverlay.hidden = true;
   deletingSubscriptionId = null;
+  onModalClose();
 }
 
 // ==========================================
@@ -1063,6 +1159,7 @@ function attachEventListeners() {
     state.budget.monthlyBudget = result.value;
     dom.budgetForm.hidden = true;
     afterStateChange();
+    showToast("Budget updated.", "success");
   });
 
   dom.closeDeleteModalBtn.addEventListener("click", closeDeleteModal);
