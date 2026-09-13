@@ -14,8 +14,13 @@ const CATEGORIES = [
 ];
 
 const MAX_NAME_LENGTH = 60;
-const MAX_COST = 100000; // sensible upper bound — no subscription costs $100k/mo
+const MAX_COST = 100000; // sensible upper bound
 const MAX_NOTES_LENGTH = 200;
+const STORAGE_KEY = "feescoach_data";
+
+const RENEWAL_WINDOW_DAYS = 7;
+const TRIAL_ALERT_WINDOW_DAYS = 7;
+const BUDGET_WARNING_THRESHOLD = 80; // percent
 
 const state = {
   subscriptions: [],
@@ -24,6 +29,7 @@ const state = {
   }
 };
 
+// Tracks which subscription is currently being edited or deleted.
 let editingSubscriptionId = null;
 let deletingSubscriptionId = null;
 
@@ -78,7 +84,6 @@ const dom = {
   subTrialEndDateInput: document.getElementById("sub-trial-end-date"),
   subNotesInput: document.getElementById("sub-notes"),
 
-  // Error spans
   subNameError: document.getElementById("sub-name-error"),
   subCategoryError: document.getElementById("sub-category-error"),
   subCostError: document.getElementById("sub-cost-error"),
@@ -96,14 +101,82 @@ const dom = {
 // ==========================================
 // LOCAL STORAGE
 // ==========================================
-// Real implementation comes in Phase 9.
 
+/**
+ * Saves the current state to LocalStorage.
+ * Wrapped in try/catch because LocalStorage can throw
+ * (private browsing mode, storage quota exceeded, disabled by browser settings).
+ */
 function saveState() {
-  // Placeholder — Phase 9.
+  try {
+    const payload = JSON.stringify({
+      subscriptions: state.subscriptions,
+      budget: state.budget
+    });
+    localStorage.setItem(STORAGE_KEY, payload);
+  } catch (error) {
+    console.error("Failed to save data to LocalStorage:", error);
+    // A save failure shouldn't interrupt the user's flow — the app
+    // keeps working in-memory; they just risk losing data on refresh.
+  }
 }
 
+/**
+ * Loads saved state from LocalStorage on startup.
+ * Defends against three failure modes:
+ *   1. LocalStorage unavailable entirely (throws on .getItem)
+ *   2. No saved data yet (getItem returns null)
+ *   3. Saved data exists but is malformed/corrupted JSON or wrong shape
+ */
 function loadState() {
-  // Placeholder — Phase 9.
+  let raw;
+  try {
+    raw = localStorage.getItem(STORAGE_KEY);
+  } catch (error) {
+    console.error("LocalStorage is unavailable:", error);
+    return;
+  }
+
+  if (!raw) return; // nothing saved yet — first-time use
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    console.error("Saved data is corrupted and could not be parsed:", error);
+    return;
+  }
+
+  if (Array.isArray(parsed.subscriptions)) {
+    state.subscriptions = parsed.subscriptions.filter(isValidStoredSubscription);
+  }
+
+  if (parsed.budget && typeof parsed.budget === "object") {
+    const budgetValue = parsed.budget.monthlyBudget;
+    state.budget.monthlyBudget =
+      typeof budgetValue === "number" && !isNaN(budgetValue) && budgetValue >= 0
+        ? budgetValue
+        : null;
+  }
+}
+
+/**
+ * Guards against partially-corrupted subscription entries
+ * (e.g., a manually edited LocalStorage blob missing fields).
+ * Any entry failing this check is silently dropped rather than
+ * crashing rendering later.
+ */
+function isValidStoredSubscription(sub) {
+  return (
+    sub &&
+    typeof sub.id === "string" &&
+    typeof sub.name === "string" &&
+    typeof sub.cost === "number" &&
+    !isNaN(sub.cost) &&
+    (sub.billingFrequency === "monthly" || sub.billingFrequency === "yearly") &&
+    typeof sub.renewalDate === "string" &&
+    (sub.status === "active" || sub.status === "paused")
+  );
 }
 
 // ==========================================
@@ -119,6 +192,39 @@ function generateId() {
 
 function formatMoney(amount) {
   return `$${amount.toFixed(2)}`;
+}
+
+/**
+ * Parses an ISO date string ("YYYY-MM-DD") as a LOCAL date at midnight,
+ * avoiding the UTC-shift bug that `new Date(dateString)` has.
+ */
+function parseLocalDate(dateString) {
+  const [year, month, day] = dateString.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+/**
+ * Returns the number of whole days between today and a given date string.
+ * Negative = in the past. 0 = today. Positive = in the future.
+ */
+function daysUntil(dateString) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const target = parseLocalDate(dateString);
+  target.setHours(0, 0, 0, 0);
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return Math.round((target - today) / msPerDay);
+}
+
+/**
+ * Converts a day offset into a human-readable label.
+ * Used for both renewals and trial alerts so wording stays consistent.
+ */
+function describeDayOffset(days) {
+  if (days < 0) return `${Math.abs(days)} day${Math.abs(days) === 1 ? "" : "s"} overdue`;
+  if (days === 0) return "today";
+  if (days === 1) return "tomorrow";
+  return `in ${days} days`;
 }
 
 // ==========================================
@@ -192,6 +298,12 @@ function validateSubscriptionForm(data) {
       errors.trialEndDate = "Trial end date is required when marking as a free trial.";
     } else if (isNaN(new Date(data.trialEndDateRaw).getTime())) {
       errors.trialEndDate = "Please enter a valid trial end date.";
+    } else if (
+      data.renewalDate.length > 0 &&
+      !isNaN(new Date(data.renewalDate).getTime()) &&
+      parseLocalDate(data.trialEndDateRaw) > parseLocalDate(data.renewalDate)
+    ) {
+      errors.trialEndDate = "Trial end date cannot be after the renewal date.";
     } else {
       trialEndDate = data.trialEndDateRaw;
     }
@@ -241,8 +353,6 @@ function validateSingleField(fieldName) {
   const data = getSubscriptionFormData();
   const result = validateSubscriptionForm(data);
 
-  // Only show/clear the one field's error, so we don't yell about
-  // fields the user hasn't reached yet.
   switch (fieldName) {
     case "name":
       dom.subNameError.textContent = result.errors.name || "";
@@ -280,17 +390,94 @@ function validateBudgetInput(rawValue) {
 // ==========================================
 // CALCULATIONS
 // ==========================================
-// Full implementation comes in Phase 10.
 
 function getActiveSubscriptions() {
   return state.subscriptions.filter(sub => sub.status === "active");
 }
 
+/** Converts any subscription's cost to its monthly equivalent. */
+function getMonthlyEquivalent(sub) {
+  return sub.billingFrequency === "yearly" ? sub.cost / 12 : sub.cost;
+}
+
 function calculateMonthlySpend() {
-  return getActiveSubscriptions().reduce((total, sub) => {
-    const monthlyCost = sub.billingFrequency === "yearly" ? sub.cost / 12 : sub.cost;
-    return total + monthlyCost;
-  }, 0);
+  return getActiveSubscriptions().reduce(
+    (total, sub) => total + getMonthlyEquivalent(sub),
+    0
+  );
+}
+
+/**
+ * Returns budget usage info, or null if no budget is set.
+ * Centralizing this means the summary card, budget panel, and any
+ * future feature all agree on the same numbers and thresholds.
+ */
+function calculateBudgetUsage() {
+  const budget = state.budget.monthlyBudget;
+  if (budget === null) return null;
+
+  const spent = calculateMonthlySpend();
+  const remaining = budget - spent;
+  const percentage = budget > 0 ? (spent / budget) * 100 : (spent > 0 ? 100 : 0);
+
+  let status = "safe";
+  if (spent > budget) {
+    status = "over";
+  } else if (percentage >= BUDGET_WARNING_THRESHOLD) {
+    status = "warning";
+  }
+
+  return { budget, spent, remaining, percentage, status };
+}
+
+/**
+ * Groups active subscriptions' monthly-equivalent cost by category.
+ * Only returns categories with spending > 0.
+ */
+function getCategoryTotals() {
+  const totals = {};
+  getActiveSubscriptions().forEach(sub => {
+    const monthly = getMonthlyEquivalent(sub);
+    totals[sub.category] = (totals[sub.category] || 0) + monthly;
+  });
+  return Object.entries(totals)
+    .filter(([, amount]) => amount > 0)
+    .map(([category, amount]) => ({ category, amount }))
+    .sort((a, b) => b.amount - a.amount);
+}
+
+/**
+ * Returns active subscriptions renewing within RENEWAL_WINDOW_DAYS,
+ * sorted soonest-first, each annotated with its day offset and label.
+ */
+function getUpcomingRenewals() {
+  return getActiveSubscriptions()
+    .map(sub => ({ subscription: sub, days: daysUntil(sub.renewalDate) }))
+    .filter(entry => entry.days >= 0 && entry.days <= RENEWAL_WINDOW_DAYS)
+    .sort((a, b) => a.days - b.days)
+    .map(entry => ({
+      ...entry,
+      label: `Renews ${describeDayOffset(entry.days)}`
+    }));
+}
+
+/**
+ * Returns trial subscriptions worth alerting about: either ending soon
+ * (within TRIAL_ALERT_WINDOW_DAYS) or already expired. Trials far in the
+ * future are intentionally excluded.
+ */
+function getTrialAlerts() {
+  return state.subscriptions
+    .filter(sub => sub.status === "active" && sub.isTrial && sub.trialEndDate)
+    .map(sub => ({ subscription: sub, days: daysUntil(sub.trialEndDate) }))
+    .filter(entry => entry.days <= TRIAL_ALERT_WINDOW_DAYS)
+    .sort((a, b) => a.days - b.days)
+    .map(entry => ({
+      ...entry,
+      label: entry.days < 0
+        ? "Trial expired"
+        : `Trial ends ${describeDayOffset(entry.days)}`
+    }));
 }
 
 // ==========================================
@@ -355,9 +542,22 @@ function resumeSubscription(id) {
   afterStateChange();
 }
 
+// Central hook: every CRUD action funnels through here,
+// implementing the Update State -> Save -> Recalculate -> Render pattern.
 function afterStateChange() {
   saveState();
   renderAll();
+}
+
+/**
+ * Checks if a subscription name (case-insensitive) already exists,
+ * excluding the subscription currently being edited (if any).
+ * Used for a soft duplicate warning, not a hard validation block.
+ */
+function isDuplicateSubscriptionName(name, excludeId) {
+  return state.subscriptions.some(sub =>
+    sub.name.toLowerCase() === name.toLowerCase() && sub.id !== excludeId
+  );
 }
 
 // ==========================================
@@ -428,42 +628,231 @@ function closeDeleteModal() {
 function renderSummaryCards() {
   const monthlySpend = calculateMonthlySpend();
   const activeCount = getActiveSubscriptions().length;
+  const budgetUsage = calculateBudgetUsage();
 
   dom.summaryMonthlySpend.textContent = formatMoney(monthlySpend);
   dom.summaryActiveCount.textContent = activeCount;
 
-  dom.summaryBudgetStatus.textContent =
-    state.budget.monthlyBudget === null ? "Not set" : "Tracking";
+  if (budgetUsage === null) {
+    dom.summaryBudgetStatus.textContent = "Not set";
+  } else {
+    const statusLabels = { safe: "On track", warning: "Approaching limit", over: "Over budget" };
+    dom.summaryBudgetStatus.textContent = statusLabels[budgetUsage.status];
+  }
 }
 
 function renderBudgetPanel() {
-  const hasBudget = state.budget.monthlyBudget !== null;
+  const budgetUsage = calculateBudgetUsage();
+  const hasBudget = budgetUsage !== null;
+
   dom.budgetPanelContent.hidden = !hasBudget;
   dom.budgetEmptyState.hidden = hasBudget;
-  // Full progress bar / status logic comes in Phase 10.
+
+  if (!hasBudget) return;
+
+  const clampedPercentage = Math.min(budgetUsage.percentage, 100);
+
+  dom.budgetProgressFill.style.width = `${clampedPercentage}%`;
+  dom.budgetProgressBar.setAttribute("aria-valuenow", Math.round(budgetUsage.percentage));
+
+  dom.budgetProgressFill.classList.remove(
+    "budget-progress__fill--warning",
+    "budget-progress__fill--danger"
+  );
+
+  const badgeClasses = {
+    safe: ["badge--safe", "Safe"],
+    warning: ["badge--warning", "Warning"],
+    over: ["badge--danger", "Over Budget"]
+  };
+  const [badgeClass, badgeLabel] = badgeClasses[budgetUsage.status];
+
+  dom.budgetStatusBadge.className = `badge ${badgeClass}`;
+  dom.budgetStatusBadge.textContent = badgeLabel;
+
+  if (budgetUsage.status === "warning") {
+    dom.budgetProgressFill.classList.add("budget-progress__fill--warning");
+  } else if (budgetUsage.status === "over") {
+    dom.budgetProgressFill.classList.add("budget-progress__fill--danger");
+  }
+
+  const remainingText = budgetUsage.remaining >= 0
+    ? `${formatMoney(budgetUsage.remaining)} remaining`
+    : `${formatMoney(Math.abs(budgetUsage.remaining))} over budget`;
+
+  dom.budgetSummaryText.textContent =
+    `${formatMoney(budgetUsage.spent)} of ${formatMoney(budgetUsage.budget)} used ` +
+    `(${Math.round(budgetUsage.percentage)}%) · ${remainingText}`;
 }
 
 function renderRenewals() {
-  const hasRenewals = false; // Phase 10
+  const renewals = getUpcomingRenewals();
   dom.renewalsList.innerHTML = "";
-  dom.renewalsEmpty.hidden = hasRenewals;
+  dom.renewalsEmpty.hidden = renewals.length > 0;
+
+  renewals.forEach(entry => {
+    const li = document.createElement("li");
+
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = entry.subscription.name;
+
+    const labelSpan = document.createElement("span");
+    labelSpan.className = "alert-list__label";
+    labelSpan.textContent = entry.label;
+
+    li.appendChild(nameSpan);
+    li.appendChild(labelSpan);
+    dom.renewalsList.appendChild(li);
+  });
 }
 
 function renderTrials() {
-  const hasTrials = false; // Phase 10
-  dom.trialsPanel.hidden = !hasTrials;
+  const trialAlerts = getTrialAlerts();
+  dom.trialsPanel.hidden = trialAlerts.length === 0;
   dom.trialsList.innerHTML = "";
+
+  trialAlerts.forEach(entry => {
+    const li = document.createElement("li");
+
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = entry.subscription.name;
+
+    const labelSpan = document.createElement("span");
+    labelSpan.className = "alert-list__label";
+    labelSpan.textContent = entry.label;
+    if (entry.days < 0) {
+      labelSpan.classList.add("alert-list__label--expired");
+    }
+
+    li.appendChild(nameSpan);
+    li.appendChild(labelSpan);
+    dom.trialsList.appendChild(li);
+  });
 }
 
 // ==========================================
 // CHART / VISUALIZATION
 // ==========================================
 
+const CHART_COLORS = [
+  "#0ea5e9", // sky blue (primary)
+  "#f59e0b", // amber
+  "#10b981", // emerald
+  "#8b5cf6", // violet
+  "#ef4444", // red
+  "#06b6d4", // cyan
+  "#ec4899", // pink
+  "#84cc16"  // lime
+];
+
+const CHART_SIZE = 200;
+const CHART_STROKE_WIDTH = 28;
+const CHART_RADIUS = (CHART_SIZE - CHART_STROKE_WIDTH) / 2;
+const CHART_CIRCUMFERENCE = 2 * Math.PI * CHART_RADIUS;
+
 function renderChart() {
-  const hasSubscriptions = state.subscriptions.length > 0;
-  dom.chartEmpty.hidden = hasSubscriptions;
+  const categoryTotals = getCategoryTotals();
+  const hasData = categoryTotals.length > 0;
+
+  dom.chartEmpty.hidden = hasData;
   dom.chartContainer.innerHTML = "";
   dom.chartLegend.innerHTML = "";
+
+  if (!hasData) return;
+
+  const total = categoryTotals.reduce((sum, entry) => sum + entry.amount, 0);
+
+  const svg = buildDonutSvg(categoryTotals, total);
+  dom.chartContainer.appendChild(svg);
+
+  categoryTotals.forEach((entry, index) => {
+    const percentage = (entry.amount / total) * 100;
+    dom.chartLegend.appendChild(
+      buildLegendItem(entry.category, entry.amount, percentage, CHART_COLORS[index % CHART_COLORS.length])
+    );
+  });
+}
+
+/**
+ * Builds the SVG donut chart element using the stroke-dasharray technique:
+ * each circle segment shows only its slice of the total circumference,
+ * offset to continue where the previous slice ended.
+ */
+function buildDonutSvg(categoryTotals, total) {
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${CHART_SIZE} ${CHART_SIZE}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute(
+    "aria-label",
+    `Spending by category: ${categoryTotals.map(e => `${e.category} ${formatMoney(e.amount)}`).join(", ")}`
+  );
+
+  const center = CHART_SIZE / 2;
+
+  // Background track (full ring, faint) so partial data doesn't look broken
+  const track = document.createElementNS(svgNS, "circle");
+  track.setAttribute("cx", center);
+  track.setAttribute("cy", center);
+  track.setAttribute("r", CHART_RADIUS);
+  track.setAttribute("fill", "none");
+  track.setAttribute("stroke", "#e2e8f0");
+  track.setAttribute("stroke-width", CHART_STROKE_WIDTH);
+  svg.appendChild(track);
+
+  // Single category = a full ring in one color
+  if (categoryTotals.length === 1) {
+    const circle = document.createElementNS(svgNS, "circle");
+    circle.setAttribute("cx", center);
+    circle.setAttribute("cy", center);
+    circle.setAttribute("r", CHART_RADIUS);
+    circle.setAttribute("fill", "none");
+    circle.setAttribute("stroke", CHART_COLORS[0]);
+    circle.setAttribute("stroke-width", CHART_STROKE_WIDTH);
+    svg.appendChild(circle);
+    return svg;
+  }
+
+  // Multiple categories: each gets a dash-array segment,
+  // rotated -90deg so the first slice starts at 12 o'clock.
+  let offsetSoFar = 0;
+  categoryTotals.forEach((entry, index) => {
+    const fraction = entry.amount / total;
+    const segmentLength = fraction * CHART_CIRCUMFERENCE;
+
+    const circle = document.createElementNS(svgNS, "circle");
+    circle.setAttribute("cx", center);
+    circle.setAttribute("cy", center);
+    circle.setAttribute("r", CHART_RADIUS);
+    circle.setAttribute("fill", "none");
+    circle.setAttribute("stroke", CHART_COLORS[index % CHART_COLORS.length]);
+    circle.setAttribute("stroke-width", CHART_STROKE_WIDTH);
+    circle.setAttribute("stroke-dasharray", `${segmentLength} ${CHART_CIRCUMFERENCE - segmentLength}`);
+    circle.setAttribute("stroke-dashoffset", -offsetSoFar);
+    circle.setAttribute("transform", `rotate(-90 ${center} ${center})`);
+    circle.setAttribute("stroke-linecap", "butt");
+
+    svg.appendChild(circle);
+    offsetSoFar += segmentLength;
+  });
+
+  return svg;
+}
+
+/** Builds one legend row: colored swatch + category name + amount + percentage. */
+function buildLegendItem(category, amount, percentage, color) {
+  const li = document.createElement("li");
+
+  const swatch = document.createElement("span");
+  swatch.className = "chart-legend__swatch";
+  swatch.style.backgroundColor = color;
+
+  const text = document.createElement("span");
+  text.textContent = `${category} — ${formatMoney(amount)} (${Math.round(percentage)}%)`;
+
+  li.appendChild(swatch);
+  li.appendChild(text);
+  return li;
 }
 
 // ==========================================
@@ -474,9 +863,7 @@ function createSubscriptionCard(subscription) {
   const card = document.createElement("div");
   card.className = "subscription-card" + (subscription.status === "paused" ? " subscription-card--paused" : "");
 
-  const monthlyCost = subscription.billingFrequency === "yearly"
-    ? subscription.cost / 12
-    : subscription.cost;
+  const monthlyCost = getMonthlyEquivalent(subscription);
 
   const costLabel = subscription.billingFrequency === "yearly"
     ? `${formatMoney(subscription.cost)}/yr · ${formatMoney(monthlyCost)}/mo`
@@ -569,6 +956,7 @@ function renderSubscriptions() {
 // ==========================================
 // MASTER RENDER FUNCTION
 // ==========================================
+// Called after every state change. Keeps the whole UI in sync from one place.
 
 function renderAll() {
   renderSummaryCards();
@@ -603,7 +991,7 @@ function attachEventListeners() {
     }
   });
 
-  // --- On-blur validation for immediate feedback ---
+  // On-blur validation for immediate feedback
   dom.subNameInput.addEventListener("blur", () => validateSingleField("name"));
   dom.subCategoryInput.addEventListener("change", () => validateSingleField("category"));
   dom.subCostInput.addEventListener("blur", () => validateSingleField("cost"));
@@ -618,8 +1006,6 @@ function attachEventListeners() {
 
     if (!result.valid) {
       showSubscriptionFormErrors(result.errors);
-      // Move focus to the first invalid field so keyboard/screen-reader
-      // users land exactly where the problem is.
       const firstErrorField = Object.keys(result.errors)[0];
       const fieldToFocus = {
         name: dom.subNameInput,
@@ -631,6 +1017,14 @@ function attachEventListeners() {
       }[firstErrorField];
       if (fieldToFocus) fieldToFocus.focus();
       return;
+    }
+
+    // Soft duplicate-name warning (not a hard validation block)
+    if (isDuplicateSubscriptionName(result.data.name, editingSubscriptionId)) {
+      const proceed = confirm(
+        `You already have a subscription named "${result.data.name}". Add it anyway?`
+      );
+      if (!proceed) return;
     }
 
     clearSubscriptionFormErrors();
