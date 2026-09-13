@@ -13,6 +13,10 @@ const CATEGORIES = [
   "Other"
 ];
 
+const MAX_NAME_LENGTH = 60;
+const MAX_COST = 100000; // sensible upper bound — no subscription costs $100k/mo
+const MAX_NOTES_LENGTH = 200;
+
 const state = {
   subscriptions: [],
   budget: {
@@ -20,8 +24,6 @@ const state = {
   }
 };
 
-// Tracks which subscription is currently being edited or deleted.
-// null means "no subscription targeted" (e.g., we're adding a new one).
 let editingSubscriptionId = null;
 let deletingSubscriptionId = null;
 
@@ -76,6 +78,14 @@ const dom = {
   subTrialEndDateInput: document.getElementById("sub-trial-end-date"),
   subNotesInput: document.getElementById("sub-notes"),
 
+  // Error spans
+  subNameError: document.getElementById("sub-name-error"),
+  subCategoryError: document.getElementById("sub-category-error"),
+  subCostError: document.getElementById("sub-cost-error"),
+  subFrequencyError: document.getElementById("sub-frequency-error"),
+  subRenewalDateError: document.getElementById("sub-renewal-date-error"),
+  subTrialEndDateError: document.getElementById("sub-trial-end-date-error"),
+
   deleteModalOverlay: document.getElementById("delete-modal-overlay"),
   deleteModalMessage: document.getElementById("delete-modal-message"),
   closeDeleteModalBtn: document.getElementById("close-delete-modal"),
@@ -104,7 +114,6 @@ function generateId() {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
     return crypto.randomUUID();
   }
-  // Fallback for environments without crypto.randomUUID
   return `id-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
@@ -115,30 +124,157 @@ function formatMoney(amount) {
 // ==========================================
 // VALIDATION
 // ==========================================
-// Full rules come in Phase 8. For now: just enough to prevent empty submits.
 
-function getBasicSubscriptionFormData() {
+/**
+ * Reads raw values from the subscription form.
+ * No parsing/trimming decisions happen here — just extraction.
+ */
+function getSubscriptionFormData() {
+  const frequencyInput = dom.subscriptionForm.querySelector('input[name="billingFrequency"]:checked');
   return {
     id: dom.subIdInput.value || null,
     name: dom.subNameInput.value.trim(),
     category: dom.subCategoryInput.value,
-    cost: parseFloat(dom.subCostInput.value),
-    billingFrequency: dom.subscriptionForm.querySelector('input[name="billingFrequency"]:checked').value,
+    costRaw: dom.subCostInput.value,
+    billingFrequency: frequencyInput ? frequencyInput.value : "",
     renewalDate: dom.subRenewalDateInput.value,
     isTrial: dom.subIsTrialCheckbox.checked,
-    trialEndDate: dom.subIsTrialCheckbox.checked ? dom.subTrialEndDateInput.value : null,
+    trialEndDateRaw: dom.subTrialEndDateInput.value,
     notes: dom.subNotesInput.value.trim()
   };
 }
 
-function isBasicFormValid(data) {
-  return (
-    data.name.length > 0 &&
-    data.category.length > 0 &&
-    !isNaN(data.cost) &&
-    data.cost > 0 &&
-    data.renewalDate.length > 0
-  );
+/**
+ * Validates the full subscription form.
+ * Returns { valid: boolean, errors: { fieldName: message }, data: parsedData }
+ */
+function validateSubscriptionForm(data) {
+  const errors = {};
+
+  // --- Name ---
+  if (data.name.length === 0) {
+    errors.name = "Name is required.";
+  } else if (data.name.length > MAX_NAME_LENGTH) {
+    errors.name = `Name must be ${MAX_NAME_LENGTH} characters or fewer.`;
+  }
+
+  // --- Category ---
+  if (!CATEGORIES.includes(data.category)) {
+    errors.category = "Please select a valid category.";
+  }
+
+  // --- Cost ---
+  const cost = parseFloat(data.costRaw);
+  if (data.costRaw.trim().length === 0 || isNaN(cost)) {
+    errors.cost = "Cost is required and must be a number.";
+  } else if (cost <= 0) {
+    errors.cost = "Cost must be greater than zero.";
+  } else if (cost > MAX_COST) {
+    errors.cost = `Cost must be less than ${formatMoney(MAX_COST)}.`;
+  }
+
+  // --- Billing frequency ---
+  if (data.billingFrequency !== "monthly" && data.billingFrequency !== "yearly") {
+    errors.frequency = "Please select a billing frequency.";
+  }
+
+  // --- Renewal date ---
+  if (data.renewalDate.length === 0) {
+    errors.renewalDate = "Renewal date is required.";
+  } else if (isNaN(new Date(data.renewalDate).getTime())) {
+    errors.renewalDate = "Please enter a valid date.";
+  }
+
+  // --- Trial end date (only relevant if isTrial is checked) ---
+  let trialEndDate = null;
+  if (data.isTrial) {
+    if (data.trialEndDateRaw.length === 0) {
+      errors.trialEndDate = "Trial end date is required when marking as a free trial.";
+    } else if (isNaN(new Date(data.trialEndDateRaw).getTime())) {
+      errors.trialEndDate = "Please enter a valid trial end date.";
+    } else {
+      trialEndDate = data.trialEndDateRaw;
+    }
+  }
+
+  const parsedData = {
+    id: data.id,
+    name: data.name,
+    category: data.category,
+    cost: cost,
+    billingFrequency: data.billingFrequency,
+    renewalDate: data.renewalDate,
+    isTrial: data.isTrial,
+    trialEndDate: trialEndDate,
+    notes: data.notes.slice(0, MAX_NOTES_LENGTH)
+  };
+
+  return {
+    valid: Object.keys(errors).length === 0,
+    errors,
+    data: parsedData
+  };
+}
+
+/** Clears all inline error messages in the subscription form. */
+function clearSubscriptionFormErrors() {
+  dom.subNameError.textContent = "";
+  dom.subCategoryError.textContent = "";
+  dom.subCostError.textContent = "";
+  dom.subFrequencyError.textContent = "";
+  dom.subRenewalDateError.textContent = "";
+  dom.subTrialEndDateError.textContent = "";
+}
+
+/** Renders an errors object (from validateSubscriptionForm) into the form's error spans. */
+function showSubscriptionFormErrors(errors) {
+  dom.subNameError.textContent = errors.name || "";
+  dom.subCategoryError.textContent = errors.category || "";
+  dom.subCostError.textContent = errors.cost || "";
+  dom.subFrequencyError.textContent = errors.frequency || "";
+  dom.subRenewalDateError.textContent = errors.renewalDate || "";
+  dom.subTrialEndDateError.textContent = errors.trialEndDate || "";
+}
+
+/** Validates and shows an error for a single field — used for on-blur feedback. */
+function validateSingleField(fieldName) {
+  const data = getSubscriptionFormData();
+  const result = validateSubscriptionForm(data);
+
+  // Only show/clear the one field's error, so we don't yell about
+  // fields the user hasn't reached yet.
+  switch (fieldName) {
+    case "name":
+      dom.subNameError.textContent = result.errors.name || "";
+      break;
+    case "category":
+      dom.subCategoryError.textContent = result.errors.category || "";
+      break;
+    case "cost":
+      dom.subCostError.textContent = result.errors.cost || "";
+      break;
+    case "renewalDate":
+      dom.subRenewalDateError.textContent = result.errors.renewalDate || "";
+      break;
+    case "trialEndDate":
+      dom.subTrialEndDateError.textContent = result.errors.trialEndDate || "";
+      break;
+  }
+}
+
+/** Validates the budget input. Returns { valid, error, value }. */
+function validateBudgetInput(rawValue) {
+  const value = parseFloat(rawValue);
+  if (rawValue.trim().length === 0 || isNaN(value)) {
+    return { valid: false, error: "Budget is required and must be a number.", value: null };
+  }
+  if (value < 0) {
+    return { valid: false, error: "Budget cannot be negative.", value: null };
+  }
+  if (value > MAX_COST) {
+    return { valid: false, error: `Budget must be less than ${formatMoney(MAX_COST)}.`, value: null };
+  }
+  return { valid: true, error: "", value };
 }
 
 // ==========================================
@@ -219,8 +355,6 @@ function resumeSubscription(id) {
   afterStateChange();
 }
 
-// Central hook: every CRUD action funnels through here,
-// implementing the Update State -> Save -> Recalculate -> Render pattern.
 function afterStateChange() {
   saveState();
   renderAll();
@@ -235,6 +369,7 @@ function openAddSubscriptionModal() {
   dom.subscriptionForm.reset();
   dom.subIdInput.value = "";
   dom.trialEndDateField.hidden = true;
+  clearSubscriptionFormErrors();
   dom.subscriptionModalHeading.textContent = "Add Subscription";
   dom.subscriptionModalOverlay.hidden = false;
   dom.subNameInput.focus();
@@ -245,6 +380,7 @@ function openEditSubscriptionModal(id) {
   if (!subscription) return;
 
   editingSubscriptionId = id;
+  clearSubscriptionFormErrors();
 
   dom.subIdInput.value = subscription.id;
   dom.subNameInput.value = subscription.name;
@@ -268,6 +404,7 @@ function closeSubscriptionModal() {
   dom.subscriptionModalOverlay.hidden = true;
   dom.subscriptionForm.reset();
   dom.trialEndDateField.hidden = true;
+  clearSubscriptionFormErrors();
   editingSubscriptionId = null;
 }
 
@@ -307,15 +444,13 @@ function renderBudgetPanel() {
 }
 
 function renderRenewals() {
-  // Full logic comes in Phase 10.
-  const hasRenewals = false;
+  const hasRenewals = false; // Phase 10
   dom.renewalsList.innerHTML = "";
   dom.renewalsEmpty.hidden = hasRenewals;
 }
 
 function renderTrials() {
-  // Full logic comes in Phase 10.
-  const hasTrials = false;
+  const hasTrials = false; // Phase 10
   dom.trialsPanel.hidden = !hasTrials;
   dom.trialsList.innerHTML = "";
 }
@@ -325,7 +460,6 @@ function renderTrials() {
 // ==========================================
 
 function renderChart() {
-  // Full chart implementation comes in Phase 12.
   const hasSubscriptions = state.subscriptions.length > 0;
   dom.chartEmpty.hidden = hasSubscriptions;
   dom.chartContainer.innerHTML = "";
@@ -348,7 +482,6 @@ function createSubscriptionCard(subscription) {
     ? `${formatMoney(subscription.cost)}/yr · ${formatMoney(monthlyCost)}/mo`
     : `${formatMoney(subscription.cost)}/mo`;
 
-  // --- Top row: name + cost ---
   const topRow = document.createElement("div");
   topRow.className = "subscription-card__top";
 
@@ -363,12 +496,10 @@ function createSubscriptionCard(subscription) {
   topRow.appendChild(nameEl);
   topRow.appendChild(costEl);
 
-  // --- Meta row: category + renewal date ---
   const metaEl = document.createElement("p");
   metaEl.className = "subscription-card__meta";
   metaEl.textContent = `${subscription.category} · Renews ${subscription.renewalDate}`;
 
-  // --- Badges row ---
   const badgesRow = document.createElement("div");
   badgesRow.className = "subscription-card__badges";
 
@@ -386,7 +517,6 @@ function createSubscriptionCard(subscription) {
     badgesRow.appendChild(trialBadge);
   }
 
-  // --- Actions row ---
   const actionsRow = document.createElement("div");
   actionsRow.className = "subscription-card__actions";
 
@@ -418,7 +548,6 @@ function createSubscriptionCard(subscription) {
   actionsRow.appendChild(pauseResumeBtn);
   actionsRow.appendChild(deleteBtn);
 
-  // --- Assemble card ---
   card.appendChild(topRow);
   card.appendChild(metaEl);
   if (badgesRow.children.length > 0) card.appendChild(badgesRow);
@@ -469,46 +598,75 @@ function attachEventListeners() {
 
   dom.subIsTrialCheckbox.addEventListener("change", () => {
     dom.trialEndDateField.hidden = !dom.subIsTrialCheckbox.checked;
+    if (!dom.subIsTrialCheckbox.checked) {
+      dom.subTrialEndDateError.textContent = "";
+    }
   });
+
+  // --- On-blur validation for immediate feedback ---
+  dom.subNameInput.addEventListener("blur", () => validateSingleField("name"));
+  dom.subCategoryInput.addEventListener("change", () => validateSingleField("category"));
+  dom.subCostInput.addEventListener("blur", () => validateSingleField("cost"));
+  dom.subRenewalDateInput.addEventListener("blur", () => validateSingleField("renewalDate"));
+  dom.subTrialEndDateInput.addEventListener("blur", () => validateSingleField("trialEndDate"));
 
   dom.subscriptionForm.addEventListener("submit", (event) => {
     event.preventDefault();
 
-    const data = getBasicSubscriptionFormData();
+    const rawData = getSubscriptionFormData();
+    const result = validateSubscriptionForm(rawData);
 
-    if (!isBasicFormValid(data)) {
-      // Real field-by-field validation messages come in Phase 8.
-      alert("Please fill in all required fields with valid values.");
+    if (!result.valid) {
+      showSubscriptionFormErrors(result.errors);
+      // Move focus to the first invalid field so keyboard/screen-reader
+      // users land exactly where the problem is.
+      const firstErrorField = Object.keys(result.errors)[0];
+      const fieldToFocus = {
+        name: dom.subNameInput,
+        category: dom.subCategoryInput,
+        cost: dom.subCostInput,
+        frequency: dom.subscriptionForm.querySelector('input[name="billingFrequency"]'),
+        renewalDate: dom.subRenewalDateInput,
+        trialEndDate: dom.subTrialEndDateInput
+      }[firstErrorField];
+      if (fieldToFocus) fieldToFocus.focus();
       return;
     }
 
+    clearSubscriptionFormErrors();
+
     if (editingSubscriptionId) {
-      updateSubscription(editingSubscriptionId, data);
+      updateSubscription(editingSubscriptionId, result.data);
     } else {
-      addSubscription(data);
+      addSubscription(result.data);
     }
 
     closeSubscriptionModal();
   });
 
   dom.editBudgetBtn.addEventListener("click", () => {
+    dom.budgetInputError.textContent = "";
     dom.budgetForm.hidden = false;
+    dom.budgetInput.focus();
   });
 
   dom.cancelBudgetBtn.addEventListener("click", () => {
     dom.budgetForm.hidden = true;
+    dom.budgetInputError.textContent = "";
   });
 
   dom.budgetForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    // Full budget save logic comes in Phase 8/10 (with proper validation).
-    const value = parseFloat(dom.budgetInput.value);
-    if (isNaN(value) || value < 0) {
-      dom.budgetInputError.textContent = "Enter a valid budget amount.";
+    const result = validateBudgetInput(dom.budgetInput.value);
+
+    if (!result.valid) {
+      dom.budgetInputError.textContent = result.error;
+      dom.budgetInput.focus();
       return;
     }
+
     dom.budgetInputError.textContent = "";
-    state.budget.monthlyBudget = value;
+    state.budget.monthlyBudget = result.value;
     dom.budgetForm.hidden = true;
     afterStateChange();
   });
